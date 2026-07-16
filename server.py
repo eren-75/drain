@@ -3,15 +3,14 @@ from datetime import datetime, timedelta
 import sqlite3
 import threading
 import time
-import os
 
 app = Flask(__name__)
+
 # Kalici disk (volume) yolu ortam degiskeninden okunuyor.
 # Railway'de: Volume ekleyip mount path'i DATA_DIR olarak Variables'a yazarsin.
-# Render'da: render.yaml zaten /var/data'ya baglar, onu kullanmak icin
-#            DATA_DIR=/var/data set edebilirsin (ya da bos birak, "." kullanilir).
 # Hicbir volume/env yoksa "." (calisma dizini) kullanilir — ama bu durumda
 # yeniden deploy'da veritabani sifirlanabilir (ephemeral disk).
+import os
 _DATA_DIR = os.environ.get("DATA_DIR", ".")
 if not os.path.isdir(_DATA_DIR):
     os.makedirs(_DATA_DIR, exist_ok=True)
@@ -143,7 +142,7 @@ def auto_cleanup():
 # Not: Bulut deploy mimarisinde server ESP32'ye dogrudan istek atamaz
 # (ESP32 NAT arkasinda, disaridan ulasilamaz). Bunun yerine ESP32 zaten
 # her "live" mesajinda /api/measurement'a istek atiyor ve response
-# icinde guncel fluid_intake degerini okuyup kendi 40016 register'ini
+# icinde guncel fluid_intake degerini okuyup kendi register'ini
 # gunceller. Intake sayfasindan (veya Kinco'dan) eklenen su, bir sonraki
 # ESP32 "live" istegi geldiginde (en gec ~2 saniye icinde) otomatik
 # senkronize olur — ayri bir bildirim mekanizmasina gerek yok.
@@ -241,7 +240,7 @@ HOME_HTML = '''
       <div class="tab" onclick="switchTab('history',this)">📁 Geçmiş</div>
     </div>
     <div style="display:flex;align-items:center;gap:12px">
-      <span class="timer" id="timer">Yenileniyor: 3s</span>
+      <span class="timer" id="timer">Yenileniyor: 5s</span>
       <button class="refresh-btn" onclick="loadDrains()">🔄 Yenile</button>
     </div>
   </div>
@@ -256,7 +255,7 @@ HOME_HTML = '''
   <div class="grid" id="grid"><div class="no-data">Yükleniyor...</div></div>
 </div>
 <script>
-let countdown = 3;
+let countdown = 5;
 let currentTab = 'active';
 
 const badgeMap = {
@@ -311,6 +310,7 @@ async function loadDrains() {
           ${d.room_number ? `<div style="font-size:11px;color:#64748b;margin-top:2px">🏥 Oda: ${d.room_number}</div>` : ''}
         </div>
         ${d.device_id ? `<div class="device-tag">📟 ${d.device_id}</div>` : ''}
+        ${d.device_id ? `<span onclick="event.stopPropagation(); window.open('/qr/' + d.device_id, '_blank')" style="display:inline-block;margin-top:4px;background:#0f172a;color:#38bdf8;border:1px solid #334155;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:bold;cursor:pointer;">📱 QR</span>` : ''}
       </div>
 
       ${currentTab === 'active' ? `
@@ -366,7 +366,7 @@ async function loadDrains() {
     </a>
   `).join('');
 
-  countdown = 3;
+  countdown = 5;
 }
 
 setInterval(() => {
@@ -427,7 +427,7 @@ DETAIL_HTML = '''
     .badge.blocked { background:#713f12; color:#facc15; }
     .badge.full    { background:#7f1d1d; color:#f87171; }
     .badge.reset   { background:#1e3a5f; color:#38bdf8; }
-    .chart-box { background:#1e293b; border-radius:12px; padding:20px; border:1px solid #334155; margin-bottom:24px; overflow-x:auto; overflow-y:hidden; }
+    .chart-box { background:#1e293b; border-radius:12px; padding:20px; border:1px solid #334155; margin-bottom:24px; overflow-x:scroll; overflow-y:hidden; white-space:nowrap; }
     .chart-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; }
     .table-box { background:#1e293b; border-radius:12px; padding:20px; border:1px solid #334155; max-height:400px; overflow-y:auto; }
     .table-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; }
@@ -449,7 +449,7 @@ DETAIL_HTML = '''
   <a class="back" href="/">← Geri</a>
   <h1>🩺 {{ patient_id }}</h1>
   <span style="margin-left:auto;display:flex;align-items:center;gap:10px">
-    <span class="timer" id="timer">Yenileniyor: 3s</span>
+    <span class="timer" id="timer">Yenileniyor: 5s</span>
     <button class="refresh-btn" onclick="loadData()">🔄 Yenile</button>
   </span>
 </header>
@@ -477,8 +477,8 @@ DETAIL_HTML = '''
       <div class="label" style="color:#fb923c">İÇİLEN SIVI</div>
       <div class="value" id="fluid_intake" style="color:#fb923c">—</div>
     </div>
-    <div class="card" style="border-color:#f472b6">
-      <div class="label" style="color:#f472b6">FARK (İÇİLEN - ÇEKİLEN)</div>
+    <div class="card" id="diffCard" style="border-color:#f472b6">
+      <div class="label" id="diffLabel" style="color:#f472b6">FARK (İÇİLEN - ÇEKİLEN)</div>
       <div class="value" id="diff_value" style="color:#f472b6">—</div>
     </div>
     <div class="card" style="border-color:#facc15">
@@ -486,8 +486,12 @@ DETAIL_HTML = '''
       <div class="value" id="avg_value" style="color:#facc15">—</div>
     </div>
     <div class="card info">
-      <div class="label">TOPLAM ÖLÇÜM</div>
+      <div class="label">SAATLİK ÖLÇÜM</div>
       <div class="value" id="total">—</div>
+    </div>
+    <div class="card info">
+      <div class="label">ÖLÇÜM SÜRESİ</div>
+      <div class="value" id="duration">—</div>
     </div>
     <div class="card" id="statusCard">
       <div class="label">DURUM</div>
@@ -497,8 +501,8 @@ DETAIL_HTML = '''
 
   <div class="chart-box">
     <h2>📈 Saatlik Drain Çıkışı (ml)</h2>
-    <div style="min-width: 800px;">
-      <canvas id="chart" height="80"></canvas>
+    <div id="chartWrap" style="display:inline-block; min-width:100%;">
+      <canvas id="chart"></canvas>
     </div>
   </div>
 
@@ -516,7 +520,7 @@ DETAIL_HTML = '''
 const patientId = "{{ patient_id }}";
 const sessionId = "{{ session_id }}";
 let chart = null;
-let countdown = 3;
+let countdown = 5;
 const badgeMap = {
   normal:  '<span class="badge normal">✅ Normal</span>',
   blocked: '<span class="badge blocked">⚠️ Tıkalı</span>',
@@ -532,6 +536,8 @@ const statusMap = {
   live:    { text:'📡 Canlı',  cls:'info'    },
 };
 async function loadData() {
+  countdown = 5;
+  try {
   const sRes = await fetch('/api/sessions/' + patientId);
   const sessions = await sRes.json();
   const session = sessions.find(s => s.id == sessionId);
@@ -559,9 +565,7 @@ async function loadData() {
   }
 
   const latest = data[0];
-  const totalOutput = data
-    .filter(d => d.status !== 'reset' && d.hourly_output > 0)
-    .reduce((sum, d) => sum + d.hourly_output, 0);
+  const totalOutput = session ? (session.total_output || 0) : 0;
 
   const latestFluid = latest.fluid_intake || 0;
 
@@ -569,12 +573,36 @@ async function loadData() {
   document.getElementById('hourly').textContent       = latest.hourly_output.toFixed(1) + ' ml';
   document.getElementById('total_output').textContent = totalOutput.toFixed(1) + ' ml';
   document.getElementById('fluid_intake').textContent = latestFluid.toFixed(1) + ' ml';
-  const diff = Math.max(0, latestFluid - totalOutput);
-  document.getElementById('diff_value').textContent = diff.toFixed(1) + ' ml';
-  const hourlyRows = data.filter(d => d.status !== 'reset' && d.status !== 'live' && d.status !== 'fluid_update' && d.hourly_output > 0);
-  const avg = hourlyRows.length > 0 ? (totalOutput / hourlyRows.length) : 0;
+
+  // Fark negatif olabilir: cekilen, icilenden fazlaysa bu klinik acidan
+  // onemli bir bilgi, gizlenmemeli.
+  const diff = latestFluid - totalOutput;
+  const diffCard  = document.getElementById('diffCard');
+  const diffLabel = document.getElementById('diffLabel');
+  const diffValue = document.getElementById('diff_value');
+  if (diff < 0) {
+    diffCard.style.borderColor  = '#22d3ee';
+    diffLabel.style.color       = '#22d3ee';
+    diffValue.style.color       = '#22d3ee';
+  } else {
+    diffCard.style.borderColor  = '#f472b6';
+    diffLabel.style.color       = '#f472b6';
+    diffValue.style.color       = '#f472b6';
+  }
+  diffValue.textContent = (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' ml';
+
+  const saatlikCount = data.filter(d => ['normal', 'blocked', 'full'].includes(d.status)).length;
+  document.getElementById('total').textContent = saatlikCount;
+  const avg = saatlikCount > 0 ? totalOutput / saatlikCount : 0;
   document.getElementById('avg_value').textContent = avg.toFixed(1) + ' ml';
-  document.getElementById('total').textContent        = data.length;
+  if (session && session.started_at) {
+    const start = new Date(session.started_at.replace(' ', 'T'));
+    const now = new Date();
+    const diffMs = now - start;
+    const hours = Math.floor(diffMs / 3600000);
+    const mins = Math.floor((diffMs % 3600000) / 60000);
+    document.getElementById('duration').textContent = hours + 's ' + mins + 'dk';
+  }
 
   const s = statusMap[latest.status] || { text: latest.status, cls: 'info' };
   document.getElementById('status').textContent = s.text;
@@ -582,39 +610,46 @@ async function loadData() {
 
   const filtered = data
     .filter(d => ['normal', 'blocked', 'full'].includes(d.status))
-    .slice(0, 24)
     .reverse();
-  const minWidth = Math.max(800, filtered.length * 60);
-  document.getElementById('chart').width  = minWidth;
-  document.getElementById('chart').height = 300;
-  if (chart) chart.destroy();
-  chart = new Chart(document.getElementById('chart'), {
-    type: 'bar',
-    data: {
-      labels: filtered.map(d => d.timestamp.slice(11, 16)),
-      datasets: [{
-        label: 'Saatlik Çıkış (ml)',
-        data: filtered.map(d => d.hourly_output),
-        backgroundColor: filtered.map(d =>
-          d.status === 'blocked' ? '#facc15' :
-          d.status === 'full'    ? '#f87171' : '#4ade80'),
-        borderRadius: 6,
-      }]
-    },
-    options: {
-      responsive: false,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color:'#94a3b8' }, grid: { color:'#1e293b' } },
-        y: { ticks: { color:'#94a3b8' }, grid: { color:'#334155' } }
+  const barWidth = 60;
+  const minWidth = Math.max(document.querySelector('.chart-box').clientWidth - 40, filtered.length * barWidth);
+  const canvas = document.getElementById('chart');
+  canvas.style.width  = minWidth + 'px';
+  canvas.style.height = '300px';
+  canvas.width  = minWidth;
+  canvas.height = 300;
+  document.getElementById('chartWrap').style.width = minWidth + 'px';
+  const labels = filtered.map(d => d.timestamp.slice(11, 16));
+  const values = filtered.map(d => d.hourly_output);
+  const colors = filtered.map(d =>
+    d.status === 'blocked' ? '#facc15' :
+    d.status === 'full'    ? '#f87171' : '#4ade80');
+  if (chart) {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = values;
+    chart.data.datasets[0].backgroundColor = colors;
+    chart.update('none');
+  } else {
+    chart = new Chart(document.getElementById('chart'), {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{ label: 'Saatlik Çıkış (ml)', data: values, backgroundColor: colors, borderRadius: 6 }]
+      },
+      options: {
+        responsive: false,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color:'#94a3b8' }, grid: { color:'#1e293b' } },
+          y: { ticks: { color:'#94a3b8' }, grid: { color:'#334155' } }
+        }
       }
-    }
-  });
+    });
+  }
 
   document.getElementById('tbody').innerHTML = data
     .filter(d => !['live', 'fluid_update'].includes(d.status))
-    .slice(0, 100)
     .map(d => `
     <tr>
       <td>${d.timestamp}</td>
@@ -625,8 +660,174 @@ async function loadData() {
     </tr>
   `).join('');
 
-  countdown = 3;
+  } catch(e) {
+    console.error('loadData hata:', e);
+    document.getElementById('statusCard').className = 'card danger';
+    document.getElementById('status').textContent = 'Hata: ' + e.message;
+  }
 }
+setInterval(() => {
+  countdown--;
+  document.getElementById('timer').textContent = 'Yenileniyor: ' + countdown + 's';
+  if (countdown <= 0) loadData();
+}, 1000);
+loadData();
+</script>
+</body>
+</html>
+'''
+
+PATIENT_STATUS_HTML = '''
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ patient_id }} — Durum</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:Arial,sans-serif; background:#0f172a; color:#e2e8f0; min-height:100vh; }
+    header {
+      background:#1e293b; padding:16px;
+      border-bottom:2px solid #334155; text-align:center;
+    }
+    header h1 { font-size:20px; color:#38bdf8; }
+    header p { font-size:12px; color:#64748b; margin-top:4px; }
+    .container { padding:16px; max-width:500px; margin:auto; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:16px; }
+    .card {
+      background:#1e293b; border-radius:12px; padding:14px;
+      border:1px solid #334155;
+    }
+    .card .label { font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px; }
+    .card .value { font-size:22px; font-weight:bold; }
+    .card.blue   .value { color:#38bdf8; }
+    .card.green  .value { color:#4ade80; }
+    .card.purple .value { color:#a78bfa; }
+    .card.orange .value { color:#fb923c; }
+    .card.diff-pos .value { color:#4ade80; }
+    .card.diff-neg .value { color:#f87171; }
+    .card.full { grid-column: span 2; }
+    .chart-box {
+      background:#1e293b; border-radius:12px; padding:16px;
+      border:1px solid #334155; margin-bottom:16px;
+      overflow-x:auto;
+    }
+    .chart-box h2 { font-size:13px; color:#64748b; margin-bottom:12px; }
+    .intake-btn {
+      display:block; width:100%; padding:18px;
+      background:#38bdf8; color:#0f172a;
+      border:none; border-radius:12px;
+      font-size:18px; font-weight:bold;
+      cursor:pointer; text-align:center;
+      text-decoration:none; margin-bottom:16px;
+    }
+    .intake-btn:hover { background:#7dd3fc; }
+    .badge { display:inline-block; padding:4px 10px; border-radius:20px; font-size:12px; font-weight:bold; }
+    .badge.normal  { background:#14532d; color:#4ade80; }
+    .badge.blocked { background:#713f12; color:#facc15; }
+    .badge.full    { background:#7f1d1d; color:#f87171; }
+    .badge.live    { background:#0f3460; color:#38bdf8; border:1px solid #38bdf8; }
+    .timer { text-align:center; font-size:11px; color:#475569; margin-bottom:12px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>🩺 {{ patient_id }}</h1>
+  <p id="subtitle">Yükleniyor...</p>
+</header>
+<div class="container">
+  <div class="timer" id="timer">Yenileniyor: 10s</div>
+  <div class="grid">
+    <div class="card blue">
+      <div class="label">ANLIK MİKTAR</div>
+      <div class="value" id="weight">—</div>
+    </div>
+    <div class="card green">
+      <div class="label">SON SAATLİK</div>
+      <div class="value" id="hourly">—</div>
+    </div>
+    <div class="card purple">
+      <div class="label">TOPLAM ÇEKİLEN</div>
+      <div class="value" id="total">—</div>
+    </div>
+    <div class="card orange">
+      <div class="label">İÇİLEN SIVI</div>
+      <div class="value" id="fluid">—</div>
+    </div>
+    <div class="card full" id="diffCard">
+      <div class="label">FARK (İÇİLEN - ÇEKİLEN)</div>
+      <div class="value" id="diff">—</div>
+    </div>
+  </div>
+  <div class="chart-box" style="overflow:hidden;">
+    <h2>📊 Sıvı Dengesi</h2>
+    <canvas id="chart" height="220"></canvas>
+  </div>
+  <a class="intake-btn" href="/intake/device/{{ device_id }}?tab=intake">
+    💧 Su / İçecek Ekle
+  </a>
+</div>
+<script>
+const patientId = "{{ patient_id }}";
+const sessionId = "{{ session_id }}";
+let chart = null;
+let countdown = 10;
+async function loadData() {
+  countdown = 10;
+  try {
+    const res = await fetch(`/api/measurements?patient_id=${patientId}&session_id=${sessionId}`);
+    const data = await res.json();
+    if (!data.length) return;
+    const latest = data[0];
+    const totalOutput = {{ total_output }};
+    const latestFluid = latest.fluid_intake || 0;
+    const diff = latestFluid - totalOutput;
+
+    document.getElementById('subtitle').textContent =
+      'Oda: {{ room_number }} • {{ started_at }}';
+    document.getElementById('weight').textContent = latest.weight.toFixed(1) + ' ml';
+    document.getElementById('hourly').textContent = latest.hourly_output.toFixed(1) + ' ml';
+    document.getElementById('total').textContent  = totalOutput.toFixed(1) + ' ml';
+    document.getElementById('fluid').textContent  = latestFluid.toFixed(1) + ' ml';
+    const diffEl   = document.getElementById('diff');
+    const diffCard = document.getElementById('diffCard');
+    diffEl.textContent = (diff >= 0 ? '+' : '') + diff.toFixed(1) + ' ml';
+    diffCard.className = 'card full ' + (diff >= 0 ? 'diff-pos' : 'diff-neg');
+
+    const drainVal  = totalOutput;
+    const fluidVal  = latestFluid;
+    const pieLabels = ['Toplam Çekilen', 'İçilen Sıvı'];
+    const pieData   = [drainVal, fluidVal];
+    const pieColors = ['#a78bfa', '#fb923c'];
+    if (chart) {
+      chart.data.labels = pieLabels;
+      chart.data.datasets[0].data = pieData;
+      chart.update('none');
+    } else {
+      chart = new Chart(document.getElementById('chart'), {
+        type: 'doughnut',
+        data: {
+          labels: pieLabels,
+          datasets: [{ data: pieData, backgroundColor: pieColors, borderWidth: 2, borderColor: '#1e293b' }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 12 } } },
+            tooltip: {
+              callbacks: {
+                label: ctx => ctx.label + ': ' + ctx.parsed.toFixed(1) + ' ml'
+              }
+            }
+          }
+        }
+      });
+    }
+  } catch(e) { console.error(e); }
+}
+
 setInterval(() => {
   countdown--;
   document.getElementById('timer').textContent = 'Yenileniyor: ' + countdown + 's';
@@ -838,6 +1039,7 @@ INTAKE_HTML = '''
 <header>
   <h1>{{ patient_id }}</h1>
   <p>Sıvı Takibi</p>
+  <p id="fluidTotal" style="font-size:16px;color:#4ade80;margin-top:6px;font-weight:bold;"></p>
 </header>
 
 <div class="main-card">
@@ -933,6 +1135,7 @@ INTAKE_HTML = '''
 
 <script>
 const patientId = "{{ patient_id }}";
+const deviceId = "{{ device_id }}";
 let selectedAmount = null;
 
 function selectBottle(el, amount) {
@@ -972,12 +1175,22 @@ async function confirmIntake() {
   closeModal();
   if (!amount) return;
   document.getElementById('msg').style.display = 'none';
+  let res, retryCount = 0;
+  while (retryCount < 3) {
+    try {
+      res = await fetch('/api/intake', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ patient_id: patientId, device_id: deviceId, amount_ml: amount })
+      });
+      break;
+    } catch(err) {
+      retryCount++;
+      if (retryCount >= 3) { showMsg('Sunucuya ulaşılamadı. Tekrar deneyin.', false); return; }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
   try {
-    const res  = await fetch('/api/intake', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_id: patientId, amount_ml: amount })
-    });
     const data = await res.json();
     if (res.ok) {
       showMsg('✓ ' + amount + ' ml kaydedildi!\\nToplam: ' + data.new_total_ml.toFixed(0) + ' ml', true);
@@ -985,6 +1198,7 @@ async function confirmIntake() {
       document.getElementById('mlInput').value = '';
       selectedAmount = null;
       updateBtn();
+      loadFluidTotal();
     } else {
       showMsg(data.error || 'Bir hata oluştu.', false);
     }
@@ -1000,6 +1214,18 @@ function showMsg(text, ok) {
   el.style.display = 'block';
   window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
 }
+
+async function loadFluidTotal() {
+  try {
+    const res = await fetch('/api/intake_status?patient_id=' + patientId);
+    const d = await res.json();
+    if (d.fluid_intake !== undefined) {
+      document.getElementById('fluidTotal').textContent =
+        'İçilen Sıvı: ' + d.fluid_intake.toFixed(0) + ' ml';
+    }
+  } catch(e) {}
+}
+loadFluidTotal();
 </script>
 </body>
 </html>
@@ -1025,12 +1251,10 @@ def receive_measurement():
     patient_id    = data.get("patient_id", "BILINMIYOR").strip()
     weight        = data.get("weight", 0)
     hourly_output = data.get("hourly_output", 0)
-    # ESP32'den gelen fluid_intake artık dogrudan guveniliyor.
-    # ESP32, hem Kinco (40200/40151-40154 register) hem de bir onceki
-    # "live" cevabindan aldigi guncel toplami kendi fluidIntake
-    # degiskeninde birlestirip buraya en guncel toplami gonderiyor.
-    fluid_intake  = data.get("fluid_intake", 0)
-    status        = data.get("status", "unknown")
+    # ESP32'den gelen fluid_intake dogrudan guveniliyor.
+    fluid_intake_from_esp = data.get("fluid_intake", 0)
+    fluid_intake          = fluid_intake_from_esp
+    status                = data.get("status", "unknown")
     device_id     = data.get("device_id", "")
     room_number   = data.get("room_number", 0)
     total_output  = data.get("total_output", 0)
@@ -1043,6 +1267,17 @@ def receive_measurement():
         session_id = create_session(patient_id, device_id, room_number, patient_id)
     else:
         session_id = session['id']
+
+    # Live ölçümde ESP32'nin eski değeri DB'yi düşürmesin
+    if status == 'live' and session:
+        conn_tmp = get_db()
+        last_row = conn_tmp.execute(
+            'SELECT fluid_intake FROM measurements WHERE session_id=? ORDER BY id DESC LIMIT 1',
+            (session['id'] if session else -1,)
+        ).fetchone()
+        conn_tmp.close()
+        if last_row and (last_row['fluid_intake'] or 0) > fluid_intake_from_esp:
+            fluid_intake = last_row['fluid_intake']
 
     conn = get_db()
     conn.execute('''
@@ -1072,15 +1307,15 @@ def get_measurements():
     if patient_id and session_id:
         rows = conn.execute('''
             SELECT * FROM measurements WHERE patient_id=? AND session_id=?
-            ORDER BY timestamp DESC LIMIT 100
+            ORDER BY id DESC LIMIT 1500
         ''', (patient_id, session_id)).fetchall()
     elif patient_id:
         rows = conn.execute('''
             SELECT * FROM measurements WHERE patient_id=?
-            ORDER BY timestamp DESC LIMIT 100
+            ORDER BY id DESC LIMIT 1500
         ''', (patient_id,)).fetchall()
     else:
-        rows = conn.execute('SELECT * FROM measurements ORDER BY timestamp DESC LIMIT 100').fetchall()
+        rows = conn.execute('SELECT * FROM measurements ORDER BY id DESC LIMIT 1500').fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows]), 200
 
@@ -1110,11 +1345,14 @@ def patients_summary():
     if active:
         rows = conn.execute(f'''
             SELECT s.*,
-              (SELECT m.status FROM measurements m WHERE m.session_id=s.id AND m.status NOT IN ('live', 'fluid_update') ORDER BY m.timestamp DESC LIMIT 1) as last_status,
-              (SELECT m.weight FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_weight,
-              (SELECT m.hourly_output FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_hourly,
-              (SELECT m.fluid_intake FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_fluid,
-              COALESCE(s.total_output, 0) as total_output
+              (SELECT m.status FROM measurements m WHERE m.session_id=s.id AND m.status NOT IN ('live', 'fluid_update') ORDER BY m.id DESC LIMIT 1) as last_status,
+              (SELECT m.weight FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_weight,
+              (SELECT m.hourly_output FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_hourly,
+              (SELECT m.fluid_intake FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_fluid,
+              COALESCE(s.total_output, 0) as total_output,
+              (SELECT CASE WHEN COUNT(*) > 0 THEN s.total_output / COUNT(*) ELSE 0 END
+               FROM measurements m2 WHERE m2.session_id=s.id
+               AND m2.status IN ('normal','blocked','full') AND m2.hourly_output > 0) as hourly_avg
             FROM sessions s
             WHERE s.ended_at IS NULL {device_filter}
             ORDER BY s.started_at DESC
@@ -1122,9 +1360,9 @@ def patients_summary():
     else:
         rows = conn.execute(f'''
             SELECT s.*,
-              (SELECT m.status FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_status,
-              (SELECT m.weight FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_weight,
-              (SELECT m.hourly_output FROM measurements m WHERE m.session_id=s.id ORDER BY m.timestamp DESC LIMIT 1) as last_hourly
+              (SELECT m.status FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_status,
+              (SELECT m.weight FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_weight,
+              (SELECT m.hourly_output FROM measurements m WHERE m.session_id=s.id ORDER BY m.id DESC LIMIT 1) as last_hourly
             FROM sessions s
             WHERE s.ended_at IS NOT NULL {device_filter}
             ORDER BY s.ended_at DESC LIMIT 50
@@ -1135,7 +1373,7 @@ def patients_summary():
 
 @app.route('/intake/<patient_id>')
 def intake_page(patient_id):
-    return render_template_string(INTAKE_HTML, patient_id=patient_id)
+    return render_template_string(INTAKE_HTML, patient_id=patient_id, device_id='')
 
 @app.route('/api/intake', methods=['POST'])
 def post_intake():
@@ -1143,11 +1381,12 @@ def post_intake():
     if not data:
         return jsonify({"error": "Veri gönderilemedi."}), 400
 
-    patient_id = data.get('patient_id', '').strip()
-    amount_ml  = data.get('amount_ml')
+    patient_id    = data.get('patient_id', '').strip()
+    req_device_id = data.get('device_id', '').strip()
+    amount_ml     = data.get('amount_ml')
 
-    if not patient_id or amount_ml is None:
-        return jsonify({"error": "patient_id ve amount_ml zorunludur."}), 400
+    if (not patient_id and not req_device_id) or amount_ml is None:
+        return jsonify({"error": "patient_id veya device_id, ve amount_ml zorunludur."}), 400
 
     try:
         amount_ml = float(amount_ml)
@@ -1157,16 +1396,25 @@ def post_intake():
         return jsonify({"error": "amount_ml geçerli bir sayı değil."}), 400
 
     session = get_active_session(patient_id)
+    if not session and req_device_id:
+        conn_tmp = get_db()
+        row_tmp = conn_tmp.execute(
+            'SELECT patient_id FROM sessions WHERE device_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1',
+            (req_device_id,)
+        ).fetchone()
+        conn_tmp.close()
+        if row_tmp:
+            patient_id = row_tmp['patient_id']
+            session = get_active_session(patient_id)
     if not session:
-        return jsonify({"error": f"{patient_id} için aktif seans bulunamadı. Lütfen hemşirenize danışın."}), 404
+        return jsonify({"error": "Aktif seans bulunamadı. Hemşireye danışın."}), 404
 
     session_id = session['id']
-    device_id  = session.get('device_id', '')
 
     conn = get_db()
     last = conn.execute('''
         SELECT weight, hourly_output, fluid_intake FROM measurements
-        WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1
+        WHERE session_id = ? ORDER BY id DESC LIMIT 1
     ''', (session_id,)).fetchone()
 
     if last:
@@ -1191,19 +1439,108 @@ def post_intake():
 
     print(f"[INTAKE] {patient_id} S:{session_id} +{amount_ml}ml → toplam:{new_fluid}ml")
 
-    # ESP32'ye ayrica bildirim gondermeye gerek yok — ESP32 zaten en gec
-    # ~2 saniye icinde bir sonraki "live" istegini atacak ve response
-    # icinde bu guncel new_fluid degerini alip kendi 40016 register'ini
-    # (ve dolayisiyla Kinco ekranini) senkronize edecek.
+    # Not: ESP32'ye ayrica bildirim gonderilmiyor (bulut ortaminda ESP32'ye
+    # disaridan ulasilamaz). ESP32 zaten en gec ~2 saniye icinde bir sonraki
+    # "live" istegini atacak ve response icinde bu guncel new_fluid degerini
+    # alip kendi register'ini (ve dolayisiyla Kinco ekranini) senkronize edecek.
 
     return jsonify({"success": True, "new_total_ml": new_fluid}), 200
+
+@app.route('/intake/device/<device_id>')
+def intake_device(device_id):
+    tab = request.args.get('tab', 'status')
+    conn = get_db()
+    row = conn.execute(
+        '''SELECT s.patient_id, s.id, s.room_number, s.started_at, s.total_output
+           FROM sessions s WHERE s.device_id=? AND s.ended_at IS NULL
+           ORDER BY s.id DESC LIMIT 1''',
+        (device_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return """<!DOCTYPE html><html lang="tr"><head>
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <meta http-equiv="refresh" content="10">
+        <title>Bekleniyor</title>
+        <style>body{font-family:Arial,sans-serif;background:#0f172a;color:#e2e8f0;
+          display:flex;flex-direction:column;align-items:center;justify-content:center;
+          min-height:100vh;gap:16px;text-align:center;padding:24px;}
+          h1{font-size:22px;color:#38bdf8;}p{color:#94a3b8;font-size:14px;}</style>
+        </head><body>
+        <div style="font-size:64px">⏳</div>
+        <h1>Henüz Hasta Kaydı Yok</h1>
+        <p>Hemşire ölçümü başlattığında bu sayfa otomatik yenilenir.</p>
+        <p style="font-size:12px;color:#475569">Cihaz: """ + device_id + """</p>
+        </body></html>""", 200
+    if tab == 'intake':
+        return render_template_string(INTAKE_HTML, patient_id=row['patient_id'], device_id=device_id)
+    return render_template_string(PATIENT_STATUS_HTML,
+        patient_id=row['patient_id'],
+        device_id=device_id,
+        session_id=row['id'],
+        room_number=row['room_number'] or '—',
+        started_at=(row['started_at'] or '')[:16],
+        total_output=row['total_output'] or 0
+    )
+
+@app.route('/qr/<device_id>')
+def qr_page(device_id):
+    from flask import request as freq
+    server_url = freq.host_url.rstrip('/')
+    intake_url = f"{server_url}/intake/device/{device_id}"
+    html = f"""<!DOCTYPE html><html lang="tr"><head>
+    <meta charset="UTF-8"><title>QR — {device_id}</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+      body{{font-family:Arial,sans-serif;background:#fff;color:#111;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        min-height:100vh;gap:12px;text-align:center;padding:24px;}}
+      h1{{font-size:20px;color:#0f172a;}}
+      .sub{{color:#555;font-size:14px;}}
+      .url{{font-size:11px;color:#888;word-break:break-all;max-width:260px;margin-top:8px;}}
+      .device{{font-size:12px;color:#aaa;}}
+      .print-btn{{margin-top:16px;padding:10px 28px;background:#0f172a;color:#fff;
+        border:none;border-radius:8px;font-size:15px;cursor:pointer;}}
+      @media print{{.print-btn{{display:none;}}}}
+    </style></head><body>
+    <h1>&#x1F4A7; Sıvı Takibi</h1>
+    <p class="sub">QR kodu okutarak içtiğiniz sıvıyı kaydedin</p>
+    <div id="qr" style="margin:8px auto;"></div>
+    <div class="url">{intake_url}</div>
+    <p class="device">Cihaz: {device_id}</p>
+    <button class="print-btn" onclick="window.print()">&#x1F5A8;&#xFE0F; Yazdır</button>
+    <script>
+    new QRCode(document.getElementById("qr"), {{
+        text: "{intake_url}",
+        width: 240, height: 240,
+        colorDark: "#000000", colorLight: "#ffffff",
+        correctLevel: QRCode.CorrectLevel.H
+    }});
+    </script>
+    </body></html>"""
+    return html
+
+@app.route('/api/intake_status', methods=['GET'])
+def intake_status():
+    patient_id = request.args.get('patient_id', '').strip()
+    if not patient_id:
+        return jsonify({"error": "patient_id gerekli"}), 400
+    conn = get_db()
+    row = conn.execute('''
+        SELECT fluid_intake FROM measurements
+        WHERE patient_id=? ORDER BY id DESC LIMIT 1
+    ''', (patient_id,)).fetchone()
+    conn.close()
+    if row:
+        return jsonify({"fluid_intake": row['fluid_intake'] or 0}), 200
+    return jsonify({"fluid_intake": 0}), 200
 
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
 
 # Modul seviyesinde baslatiliyor ki hem "python server.py" (yerel test)
-# hem de gunicorn (Render production) altinda calissin. Gunicorn dosyayi
+# hem de gunicorn (Railway production) altinda calissin. Gunicorn dosyayi
 # sadece import ettigi icin "if __name__ == '__main__'" bloğu calismaz.
 init_db()
 threading.Thread(target=auto_close_sessions, daemon=True).start()
