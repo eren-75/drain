@@ -1,8 +1,9 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
 from datetime import datetime, timedelta
 import sqlite3
 import threading
 import time
+import io
 
 app = Flask(__name__)
 
@@ -15,6 +16,11 @@ _DATA_DIR = os.environ.get("DATA_DIR", ".")
 if not os.path.isdir(_DATA_DIR):
     os.makedirs(_DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(_DATA_DIR, "drain_monitor.db")
+
+# PDF raporlarin kaydedilecegi klasor — ayni kalici diskin altinda
+REPORTS_DIR = os.path.join(_DATA_DIR, "reports")
+if not os.path.isdir(REPORTS_DIR):
+    os.makedirs(REPORTS_DIR, exist_ok=True)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -42,7 +48,29 @@ def init_db():
             total_output REAL    DEFAULT 0,
             note         TEXT,
             room_number  INTEGER DEFAULT 0,
-            patient_name TEXT    DEFAULT ''
+            patient_name TEXT    DEFAULT '',
+            last_report_hour INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS comments (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   INTEGER NOT NULL,
+            patient_id   TEXT    NOT NULL,
+            nurse_name   TEXT    NOT NULL,
+            comment_text TEXT    NOT NULL,
+            timestamp    TEXT    NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS reports (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   INTEGER NOT NULL,
+            patient_id   TEXT    NOT NULL,
+            report_type  TEXT    NOT NULL,
+            hour_mark    INTEGER DEFAULT 0,
+            file_path    TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL
         )
     ''')
     try:
@@ -55,6 +83,10 @@ def init_db():
         pass
     try:
         c.execute("ALTER TABLE sessions ADD COLUMN patient_name TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        c.execute('ALTER TABLE sessions ADD COLUMN last_report_hour INTEGER DEFAULT 0')
     except Exception:
         pass
     conn.commit()
@@ -103,6 +135,272 @@ def close_session(session_id):
     conn.commit()
     conn.close()
     print(f"[SESSION] Session {session_id} kapatildi. Toplam: {total}g")
+
+# ─────────────────────────────────────────
+# PDF RAPOR URETIMI
+# ─────────────────────────────────────────
+
+def generate_pdf_report(session_id, report_type="manual", hour_mark=0):
+    """Bir session icin PDF rapor uretir, diske kaydeder ve dosya yolunu dondurur.
+    report_type: 'manual' (hemsire istegiyle) veya 'auto' (24 saatlik otomatik)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                     Paragraph, Spacer, Image as RLImage)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    import matplotlib
+    matplotlib.use('Agg')  # Sunucu tarafinda ekran gerektirmeyen backend
+    import matplotlib.pyplot as plt
+
+    conn = get_db()
+    session = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    if not session:
+        conn.close()
+        return None
+
+    session = dict(session)
+    patient_id = session['patient_id']
+
+    measurements = conn.execute('''
+        SELECT * FROM measurements WHERE session_id=?
+        ORDER BY id ASC
+    ''', (session_id,)).fetchall()
+    measurements = [dict(m) for m in measurements]
+
+    comments = conn.execute('''
+        SELECT * FROM comments WHERE session_id=?
+        ORDER BY id ASC
+    ''', (session_id,)).fetchall()
+    comments = [dict(c) for c in comments]
+    conn.close()
+
+    # Sadece gercek saatlik olcumler (grafik ve tablo icin)
+    hourly_rows = [m for m in measurements if m['status'] in ('normal', 'blocked', 'full')]
+
+    total_output = session.get('total_output', 0) or 0
+    latest_fluid = 0
+    for m in reversed(measurements):
+        if m.get('fluid_intake'):
+            latest_fluid = m['fluid_intake']
+            break
+    diff = latest_fluid - total_output
+    avg_hourly = (total_output / len(hourly_rows)) if hourly_rows else 0
+
+    # ── Grafik uret (matplotlib) ──
+    chart_path = None
+    if hourly_rows:
+        fig, ax = plt.subplots(figsize=(7, 3))
+        labels = [m['timestamp'][11:16] for m in hourly_rows]
+        values = [m['hourly_output'] for m in hourly_rows]
+        bar_colors = [
+            '#facc15' if m['status'] == 'blocked' else
+            '#f87171' if m['status'] == 'full' else '#4ade80'
+            for m in hourly_rows
+        ]
+        ax.bar(range(len(values)), values, color=bar_colors)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('ml')
+        ax.set_title('Saatlik Drain Çıkışı')
+        fig.tight_layout()
+
+        chart_path = os.path.join(REPORTS_DIR, f"_chart_{session_id}_{int(time.time())}.png")
+        fig.savefig(chart_path, dpi=110)
+        plt.close(fig)
+
+    # ── PDF olustur ──
+    filename = f"rapor_{patient_id}_{session_id}_{report_type}_{int(time.time())}.pdf"
+    filepath = os.path.join(REPORTS_DIR, filename)
+
+    doc = SimpleDocTemplate(filepath, pagesize=A4,
+                             topMargin=1.5*cm, bottomMargin=1.5*cm,
+                             leftMargin=1.5*cm, rightMargin=1.5*cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('TitleTR', parent=styles['Title'], fontSize=16)
+    h2_style = ParagraphStyle('H2TR', parent=styles['Heading2'], fontSize=12,
+                               spaceBefore=10, spaceAfter=6)
+    normal_style = styles['Normal']
+
+    elements = []
+    elements.append(Paragraph("Drain Takip Raporu", title_style))
+    elements.append(Spacer(1, 0.3*cm))
+
+    report_label = "Otomatik Rapor (24 Saatlik)" if report_type == "auto" else "Manuel Rapor"
+    elements.append(Paragraph(f"<b>Rapor Türü:</b> {report_label}", normal_style))
+    elements.append(Paragraph(f"<b>Oluşturulma:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style))
+    elements.append(Spacer(1, 0.4*cm))
+
+    # ── Hasta bilgileri tablosu ──
+    info_data = [
+        ["Hasta ID", session.get('patient_id', '—')],
+        ["Oda No", str(session.get('room_number') or '—')],
+        ["Cihaz ID", session.get('device_id') or '—'],
+        ["Başlangıç", session.get('started_at') or '—'],
+        ["Bitiş", session.get('ended_at') or 'Devam ediyor'],
+        ["İşlem No", f"#{session_id}"],
+    ]
+    info_table = Table(info_data, colWidths=[4*cm, 11*cm])
+    info_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#1e293b')),
+        ('TEXTCOLOR', (0,0), (0,-1), colors.white),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    elements.append(info_table)
+    elements.append(Spacer(1, 0.5*cm))
+
+    # ── Ozet kartlar ──
+    elements.append(Paragraph("Özet Değerler", h2_style))
+    summary_data = [
+        ["Toplam Çekilen", "İçilen Sıvı", "Fark", "Saatlik Ortalama"],
+        [f"{total_output:.1f} ml", f"{latest_fluid:.1f} ml",
+         f"{diff:+.1f} ml", f"{avg_hourly:.1f} ml"],
+    ]
+    summary_table = Table(summary_data, colWidths=[3.75*cm]*4)
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#334155')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('FONTNAME', (0,1), (-1,1), 'Helvetica-Bold'),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    elements.append(summary_table)
+    elements.append(Spacer(1, 0.5*cm))
+
+    # ── Grafik ──
+    if chart_path and os.path.exists(chart_path):
+        elements.append(Paragraph("Saatlik Drain Çıkışı Grafiği", h2_style))
+        elements.append(RLImage(chart_path, width=16*cm, height=6.5*cm))
+        elements.append(Spacer(1, 0.4*cm))
+
+    # ── Olcum tablosu ──
+    elements.append(Paragraph("Ölçüm Geçmişi", h2_style))
+    table_data = [["Zaman", "Miktar (ml)", "Saatlik (ml)", "İçilen Sıvı (ml)", "Durum"]]
+    status_labels = {
+        'normal': 'Normal', 'blocked': 'Tıkalı', 'full': 'Dolu', 'reset': 'Reset'
+    }
+    display_rows = [m for m in measurements if m['status'] not in ('live', 'fluid_update')]
+    for m in display_rows:
+        table_data.append([
+            m['timestamp'],
+            f"{m['weight']:.1f}",
+            f"{m['hourly_output']:.1f}",
+            f"{(m.get('fluid_intake') or 0):.1f}",
+            status_labels.get(m['status'], m['status'])
+        ])
+
+    if len(table_data) > 1:
+        meas_table = Table(table_data, colWidths=[3.8*cm, 2.8*cm, 2.8*cm, 3.2*cm, 2.4*cm], repeatRows=1)
+        meas_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#334155')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('GRID', (0,0), (-1,-1), 0.4, colors.grey),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f1f5f9')]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(meas_table)
+    else:
+        elements.append(Paragraph("Henüz ölçüm kaydı yok.", normal_style))
+
+    elements.append(Spacer(1, 0.5*cm))
+
+    # ── Hemsire yorumlari ──
+    elements.append(Paragraph("Hemşire Notları", h2_style))
+    if comments:
+        comment_data = [["Zaman", "Hemşire", "Not"]]
+        for c in comments:
+            comment_data.append([c['timestamp'], c['nurse_name'], c['comment_text']])
+        comment_table = Table(comment_data, colWidths=[3.5*cm, 3.5*cm, 8*cm], repeatRows=1)
+        comment_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#334155')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTSIZE', (0,0), (-1,-1), 8),
+            ('GRID', (0,0), (-1,-1), 0.4, colors.grey),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ]))
+        elements.append(comment_table)
+    else:
+        elements.append(Paragraph("Kayıtlı not bulunmuyor.", normal_style))
+
+    doc.build(elements)
+
+    # Gecici grafik dosyasini temizle
+    if chart_path and os.path.exists(chart_path):
+        os.remove(chart_path)
+
+    # Veritabanina kaydet
+    conn = get_db()
+    conn.execute('''
+        INSERT INTO reports (session_id, patient_id, report_type, hour_mark, file_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (session_id, patient_id, report_type, hour_mark, filepath,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+    print(f"[PDF] Rapor uretildi: {filename} (session {session_id}, tip: {report_type})")
+    return filepath
+
+def check_and_generate_auto_report(session_id):
+    """Bir session'daki gercek saatlik olcum sayisi 24'un katina ulastiginda
+    ve o dilim icin daha once rapor uretilmediyse otomatik PDF olusturur.
+
+    Es zamanli gelen birden fazla istek (ayni anda birkac olcum POST edilmesi)
+    ayni anda bu fonksiyonu tetikleyebilir. Sadece TEK thread'in rapor
+    uretmesini garanti etmek icin atomik bir "claim" (UPDATE...WHERE) yapiyoruz:
+    UPDATE sadece last_report_hour hala eski degerdeyse satiri gunceller ve
+    etkilenen satir sayisi 1 donerse "hakkimizi kazandik" demektir."""
+    conn = get_db()
+    session = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    if not session:
+        conn.close()
+        return
+
+    hourly_count = conn.execute('''
+        SELECT COUNT(*) as cnt FROM measurements
+        WHERE session_id=? AND status IN ('normal','blocked','full')
+    ''', (session_id,)).fetchone()['cnt']
+
+    if hourly_count == 0:
+        conn.close()
+        return
+
+    current_block = hourly_count // 24  # 24=1, 48=2, 72=3 ...
+    last_report_hour = session['last_report_hour'] or 0
+    last_block = last_report_hour // 24
+
+    if hourly_count % 24 == 0 and current_block > last_block:
+        # Atomik claim: sadece last_report_hour hala eski degerdeyse guncelle.
+        # SQLite tek yazicili oldugu icin bu islem gercekten atomiktir —
+        # ayni anda birden fazla thread calissa bile sadece biri basarili olur.
+        cur = conn.execute('''
+            UPDATE sessions SET last_report_hour = ?
+            WHERE id = ? AND last_report_hour = ?
+        ''', (hourly_count, session_id, last_report_hour))
+        conn.commit()
+        won_claim = cur.rowcount == 1
+        conn.close()
+
+        if not won_claim:
+            # Baska bir thread bizden once hakki kazandi, biz cikiyoruz
+            return
+
+        try:
+            generate_pdf_report(session_id, report_type="auto", hour_mark=hourly_count)
+        except Exception as e:
+            print(f"[PDF] Otomatik rapor hatasi (session {session_id}): {e}")
 
 def auto_close_sessions():
     while True:
@@ -431,6 +729,71 @@ DETAIL_HTML = '''
     .chart-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; }
     .table-box { background:#1e293b; border-radius:12px; padding:20px; border:1px solid #334155; max-height:400px; overflow-y:auto; }
     .table-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; }
+
+    .report-box {
+      background:#1e293b; border-radius:12px; padding:20px;
+      border:1px solid #334155; margin-top:24px;
+    }
+    .report-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; display:flex; justify-content:space-between; align-items:center; }
+    .gen-report-btn {
+      background:#a78bfa; color:#1e1b3a; border:none;
+      border-radius:8px; padding:8px 16px; font-size:13px;
+      font-weight:bold; cursor:pointer;
+    }
+    .gen-report-btn:hover { background:#c4b5fd; }
+    .gen-report-btn:disabled { background:#475569; color:#94a3b8; cursor:wait; }
+    .report-list { display:flex; flex-direction:column; gap:8px; }
+    .report-item {
+      display:flex; justify-content:space-between; align-items:center;
+      background:#0f172a; border-radius:8px; padding:10px 14px;
+      font-size:13px; border:1px solid #334155;
+    }
+    .report-item .r-info { display:flex; flex-direction:column; gap:2px; }
+    .report-item .r-type { font-weight:bold; color:#e2e8f0; }
+    .report-item .r-date { font-size:11px; color:#64748b; }
+    .report-item .r-badge {
+      font-size:11px; padding:2px 8px; border-radius:10px;
+      background:#312e81; color:#a5b4fc;
+    }
+    .report-item .r-badge.manual { background:#312e81; color:#a5b4fc; }
+    .report-item .r-badge.auto   { background:#164e63; color:#67e8f9; }
+    .report-item a.dl-btn {
+      background:#38bdf8; color:#0f172a; text-decoration:none;
+      padding:6px 12px; border-radius:6px; font-size:12px; font-weight:bold;
+    }
+    .report-item a.dl-btn:hover { background:#7dd3fc; }
+
+    .comment-box {
+      background:#1e293b; border-radius:12px; padding:20px;
+      border:1px solid #334155; margin-top:24px;
+    }
+    .comment-box h2 { font-size:15px; color:#94a3b8; margin-bottom:16px; }
+    .comment-form { display:flex; flex-direction:column; gap:10px; margin-bottom:16px; }
+    .comment-form input, .comment-form textarea {
+      background:#0f172a; color:#e2e8f0; border:1px solid #334155;
+      border-radius:8px; padding:10px 12px; font-size:13px; font-family:inherit;
+      outline:none;
+    }
+    .comment-form input:focus, .comment-form textarea:focus { border-color:#38bdf8; }
+    .comment-form textarea { resize:vertical; min-height:60px; }
+    .comment-submit-btn {
+      background:#38bdf8; color:#0f172a; border:none;
+      border-radius:8px; padding:10px 16px; font-size:13px;
+      font-weight:bold; cursor:pointer; align-self:flex-start;
+    }
+    .comment-submit-btn:hover { background:#7dd3fc; }
+    .comment-list { display:flex; flex-direction:column; gap:10px; }
+    .comment-item {
+      background:#0f172a; border-radius:8px; padding:12px 14px;
+      border:1px solid #334155; font-size:13px;
+    }
+    .comment-item .c-header {
+      display:flex; justify-content:space-between; margin-bottom:6px;
+    }
+    .comment-item .c-nurse { font-weight:bold; color:#38bdf8; }
+    .comment-item .c-time { font-size:11px; color:#64748b; }
+    .comment-item .c-text { color:#cbd5e1; line-height:1.5; }
+    .no-items { color:#64748b; font-size:13px; text-align:center; padding:16px; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
     thead { position:sticky; top:0; background:#1e293b; z-index:1; }
     th { text-align:left; color:#64748b; padding:8px 12px; border-bottom:1px solid #334155; }
@@ -514,6 +877,28 @@ DETAIL_HTML = '''
       </thead>
       <tbody id="tbody"></tbody>
     </table>
+  </div>
+
+  <div class="report-box">
+    <h2>
+      <span>📄 PDF Raporlar</span>
+      <button class="gen-report-btn" id="genReportBtn" onclick="generateReportNow()">Şimdi Rapor Oluştur</button>
+    </h2>
+    <div class="report-list" id="reportList">
+      <div class="no-items">Yükleniyor...</div>
+    </div>
+  </div>
+
+  <div class="comment-box">
+    <h2>📝 Hemşire Notları</h2>
+    <div class="comment-form">
+      <input type="text" id="nurseNameInput" placeholder="Hemşire adı">
+      <textarea id="commentTextInput" placeholder="Not... (örn. Hastanın idrarında kan görüldü, ölçümü durduruyorum)"></textarea>
+      <button class="comment-submit-btn" onclick="submitComment()">Notu Ekle</button>
+    </div>
+    <div class="comment-list" id="commentList">
+      <div class="no-items">Yükleniyor...</div>
+    </div>
   </div>
 </div>
 <script>
@@ -666,12 +1051,114 @@ async function loadData() {
     document.getElementById('status').textContent = 'Hata: ' + e.message;
   }
 }
+
+// ─── PDF Raporlar ───
+async function loadReports() {
+  try {
+    const res = await fetch(`/api/reports/${sessionId}`);
+    const reports = await res.json();
+    const listEl = document.getElementById('reportList');
+    if (!reports.length) {
+      listEl.innerHTML = '<div class="no-items">Henüz rapor oluşturulmadı.</div>';
+      return;
+    }
+    listEl.innerHTML = reports.map(r => {
+      const typeLabel = r.report_type === 'auto'
+        ? `Otomatik Rapor (${r.hour_mark}. Saat)`
+        : 'Manuel Rapor';
+      const badgeCls = r.report_type === 'auto' ? 'auto' : 'manual';
+      return `
+        <div class="report-item">
+          <div class="r-info">
+            <span class="r-type">${typeLabel} <span class="r-badge ${badgeCls}">${r.report_type}</span></span>
+            <span class="r-date">${r.created_at}</span>
+          </div>
+          <a class="dl-btn" href="/report/download/${r.id}" target="_blank">⬇ İndir</a>
+        </div>
+      `;
+    }).join('');
+  } catch(e) {
+    console.error('loadReports hata:', e);
+  }
+}
+
+async function generateReportNow() {
+  const btn = document.getElementById('genReportBtn');
+  btn.disabled = true;
+  btn.textContent = 'Oluşturuluyor...';
+  try {
+    const res = await fetch(`/api/reports/generate/${sessionId}`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      await loadReports();
+    } else {
+      alert(data.error || 'Rapor oluşturulamadı.');
+    }
+  } catch(e) {
+    alert('Sunucuya ulaşılamadı.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Şimdi Rapor Oluştur';
+  }
+}
+
+// ─── Hemşire Notları ───
+async function loadComments() {
+  try {
+    const res = await fetch(`/api/comments/${sessionId}`);
+    const comments = await res.json();
+    const listEl = document.getElementById('commentList');
+    if (!comments.length) {
+      listEl.innerHTML = '<div class="no-items">Henüz not eklenmedi.</div>';
+      return;
+    }
+    listEl.innerHTML = comments.map(c => `
+      <div class="comment-item">
+        <div class="c-header">
+          <span class="c-nurse">👤 ${c.nurse_name}</span>
+          <span class="c-time">${c.timestamp}</span>
+        </div>
+        <div class="c-text">${c.comment_text}</div>
+      </div>
+    `).join('');
+  } catch(e) {
+    console.error('loadComments hata:', e);
+  }
+}
+
+async function submitComment() {
+  const nurseName = document.getElementById('nurseNameInput').value.trim();
+  const commentText = document.getElementById('commentTextInput').value.trim();
+  if (!nurseName || !commentText) {
+    alert('Lütfen hemşire adı ve not metnini girin.');
+    return;
+  }
+  try {
+    const res = await fetch('/api/comments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, nurse_name: nurseName, comment_text: commentText })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      document.getElementById('commentTextInput').value = '';
+      await loadComments();
+    } else {
+      alert(data.error || 'Not eklenemedi.');
+    }
+  } catch(e) {
+    alert('Sunucuya ulaşılamadı.');
+  }
+}
+
 setInterval(() => {
   countdown--;
   document.getElementById('timer').textContent = 'Yenileniyor: ' + countdown + 's';
-  if (countdown <= 0) loadData();
+  if (countdown <= 0) { loadData(); loadReports(); }
 }, 1000);
 loadData();
+loadReports();
+loadComments();
 </script>
 </body>
 </html>
@@ -1296,6 +1783,16 @@ def receive_measurement():
     if status == "reset" and session:
         close_session(session_id)
 
+    # Gercek saatlik olcum ise (normal/blocked/full) 24 saatlik otomatik
+    # rapor esigine ulasildi mi kontrol et. PDF uretimi zaman alabilir,
+    # bu yuzden ESP32'nin cevabini bekletmemek icin ayri thread'de calistir.
+    if status in ('normal', 'blocked', 'full'):
+        threading.Thread(
+            target=check_and_generate_auto_report,
+            args=(session_id,),
+            daemon=True
+        ).start()
+
     print(f"[{timestamp}] {patient_id} ({device_id}) S:{session_id} | {weight}g | {hourly_output}g/h | sivi:{fluid_intake}g | {status}")
     return jsonify({"success": True, "session_id": session_id, "timestamp": timestamp, "fluid_intake": fluid_intake}), 200
 
@@ -1534,6 +2031,101 @@ def intake_status():
     if row:
         return jsonify({"fluid_intake": row['fluid_intake'] or 0}), 200
     return jsonify({"fluid_intake": 0}), 200
+
+# ─────────────────────────────────────────
+# YORUMLAR (HEMSIRE NOTLARI)
+# ─────────────────────────────────────────
+
+@app.route('/api/comments', methods=['POST'])
+def add_comment():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Veri gönderilemedi."}), 400
+
+    session_id = data.get('session_id')
+    nurse_name = (data.get('nurse_name') or '').strip()
+    comment_text = (data.get('comment_text') or '').strip()
+
+    if not session_id or not nurse_name or not comment_text:
+        return jsonify({"error": "session_id, nurse_name ve comment_text zorunludur."}), 400
+
+    conn = get_db()
+    session = conn.execute('SELECT patient_id FROM sessions WHERE id=?', (session_id,)).fetchone()
+    if not session:
+        conn.close()
+        return jsonify({"error": "Session bulunamadı."}), 404
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute('''
+        INSERT INTO comments (session_id, patient_id, nurse_name, comment_text, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (session_id, session['patient_id'], nurse_name, comment_text, now))
+    conn.commit()
+    conn.close()
+
+    print(f"[YORUM] Session {session_id} — {nurse_name}: {comment_text}")
+    return jsonify({"success": True}), 200
+
+@app.route('/api/comments/<int:session_id>', methods=['GET'])
+def get_comments(session_id):
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT * FROM comments WHERE session_id=? ORDER BY id DESC
+    ''', (session_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows]), 200
+
+# ─────────────────────────────────────────
+# PDF RAPORLAR
+# ─────────────────────────────────────────
+
+@app.route('/api/reports/<int:session_id>', methods=['GET'])
+def list_reports(session_id):
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT * FROM reports WHERE session_id=? ORDER BY id DESC
+    ''', (session_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows]), 200
+
+@app.route('/api/reports/generate/<int:session_id>', methods=['POST'])
+def generate_report_now(session_id):
+    """Hemsirenin 'Şimdi Rapor Oluştur' butonuyla tetiklenen manuel rapor."""
+    conn = get_db()
+    session = conn.execute('SELECT id FROM sessions WHERE id=?', (session_id,)).fetchone()
+    conn.close()
+    if not session:
+        return jsonify({"error": "Session bulunamadı."}), 404
+
+    try:
+        filepath = generate_pdf_report(session_id, report_type="manual")
+        if not filepath:
+            return jsonify({"error": "Rapor oluşturulamadı."}), 500
+        report_id = None
+        conn = get_db()
+        row = conn.execute(
+            'SELECT id FROM reports WHERE file_path=? ORDER BY id DESC LIMIT 1',
+            (filepath,)
+        ).fetchone()
+        conn.close()
+        if row:
+            report_id = row['id']
+        return jsonify({"success": True, "report_id": report_id}), 200
+    except Exception as e:
+        print(f"[PDF] Manuel rapor hatasi: {e}")
+        return jsonify({"error": f"Rapor oluşturulurken hata: {e}"}), 500
+
+@app.route('/report/download/<int:report_id>', methods=['GET'])
+def download_report(report_id):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM reports WHERE id=?', (report_id,)).fetchone()
+    conn.close()
+    if not row or not os.path.exists(row['file_path']):
+        return "Rapor bulunamadı.", 404
+
+    filename = os.path.basename(row['file_path'])
+    return send_file(row['file_path'], as_attachment=True, download_name=filename,
+                      mimetype='application/pdf')
 
 @app.route('/api/health', methods=['GET'])
 def health():
